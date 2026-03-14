@@ -10,7 +10,7 @@ import httpx
 from config import settings
 from bot.telegram_api import send_message, send_chat_action, download_file
 from core.chat_handler import handle_message, handle_photo
-from db.store import upsert_user
+from db.store import upsert_user, get_due_reminders, mark_reminder_sent
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,27 @@ def _process_message(msg: dict):
     send_message(chat_id, reply)
 
 
+def _check_reminders():
+    """Send any due reminders and mark them as sent."""
+    try:
+        due = get_due_reminders()
+        for r in due:
+            # Look up the user's chat_id from their user_id
+            from db.store import _conn
+            with _conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT telegram_id FROM users WHERE id = %s", (r["user_id"],))
+                    row = cur.fetchone()
+            if row:
+                chat_id = row[0]
+                text = f"Reminder: {r['reminder_text']}"
+                send_message(chat_id, text, parse_mode="")
+                mark_reminder_sent(r["id"])
+                logger.info("Sent reminder #%s to chat %s", r["id"], chat_id)
+    except Exception as exc:
+        logger.warning("Reminder check error: %s", exc)
+
+
 def run_polling_loop():
     """Block forever, polling Telegram for new messages."""
     _delete_webhook()
@@ -116,6 +137,9 @@ def run_polling_loop():
                 _process_message(msg)
             except Exception as exc:
                 logger.error("Error processing update %s: %s", update["update_id"], exc)
+
+        # Check for due reminders every cycle
+        _check_reminders()
 
         if not updates:
             time.sleep(_POLL_INTERVAL)

@@ -89,6 +89,23 @@ def init_db():
         created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS chat_messages (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS reminders (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        reminder_text TEXT NOT NULL,
+        due_at TIMESTAMPTZ NOT NULL,
+        sent BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
     CREATE INDEX IF NOT EXISTS idx_receipt_items_user ON receipt_items(user_id);
     CREATE INDEX IF NOT EXISTS idx_receipt_items_normalized ON receipt_items(normalized_name);
     CREATE INDEX IF NOT EXISTS idx_pantry_items_user_current ON pantry_items(user_id, is_current);
@@ -339,3 +356,121 @@ def get_suggestions(user_id: int) -> list[dict]:
                 (user_id,),
             )
             return [dict(row) for row in cur.fetchall()]
+
+
+# ── Chat message helpers ───────────────────────────────────────────────────
+
+def insert_chat_message(user_id: int, role: str, content: str):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO chat_messages (user_id, role, content) VALUES (%s, %s, %s)",
+                (user_id, role, content),
+            )
+        conn.commit()
+
+
+def get_recent_chat_messages(user_id: int, limit: int = 20) -> list[dict]:
+    """Return last N messages oldest-first."""
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT role, content FROM chat_messages
+                   WHERE user_id = %s
+                   ORDER BY created_at DESC LIMIT %s""",
+                (user_id, limit),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+    return list(reversed(rows))
+
+
+# ── Manual pantry helpers ─────────────────────────────────────────────────
+
+def add_manual_pantry_item(
+    user_id: int, item_name: str, normalized_name: str,
+    location: str, category: Optional[str] = None,
+):
+    """Add a pantry item manually (no photo snapshot)."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO pantry_snapshots (user_id, snapshot_type, telegram_file_id, raw_extraction)
+                   VALUES (%s, %s, %s, %s) RETURNING id""",
+                (user_id, location, "manual", '{"source": "manual"}'),
+            )
+            snapshot_id = cur.fetchone()[0]
+            cur.execute(
+                """INSERT INTO pantry_items
+                    (snapshot_id, user_id, item_name, normalized_name,
+                     category, estimated_qty, condition, is_current)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)""",
+                (snapshot_id, user_id, item_name, normalized_name, category, "unknown", "good"),
+            )
+        conn.commit()
+
+
+def remove_pantry_item(user_id: int, normalized_name: str) -> int:
+    """Mark matching current pantry items as not current. Returns count removed."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE pantry_items SET is_current = FALSE
+                   WHERE user_id = %s AND normalized_name = %s AND is_current = TRUE""",
+                (user_id, normalized_name),
+            )
+            count = cur.rowcount
+        conn.commit()
+    return count
+
+
+# ── Reminder helpers ─────────────────────────────────────────────────────
+
+def insert_reminder(user_id: int, reminder_text: str, due_at: str):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO reminders (user_id, reminder_text, due_at) VALUES (%s, %s, %s)",
+                (user_id, reminder_text, due_at),
+            )
+        conn.commit()
+
+
+def get_due_reminders() -> list[dict]:
+    """Return unsent reminders where due_at <= NOW()."""
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT * FROM reminders WHERE sent = FALSE AND due_at <= NOW()"
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def mark_reminder_sent(reminder_id: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE reminders SET sent = TRUE WHERE id = %s", (reminder_id,))
+        conn.commit()
+
+
+def get_pending_reminders(user_id: int) -> list[dict]:
+    """Return future unsent reminders for this user."""
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT id, reminder_text, due_at FROM reminders
+                   WHERE user_id = %s AND sent = FALSE
+                   ORDER BY due_at""",
+                (user_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def get_user_timezone(user_id: int) -> str:
+    """Get user's timezone from the users table. Falls back to 'America/Los_Angeles'."""
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT timezone FROM users WHERE id = %s", (user_id,))
+            row = cur.fetchone()
+            if row and row.get("timezone"):
+                return row["timezone"]
+    return "America/Los_Angeles"

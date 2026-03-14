@@ -1,27 +1,38 @@
 """
 Chat handler — route commands, photos, and natural language messages.
+Natural language uses a tool-use agent loop with conversation history.
 """
 
 import base64
 import json
 import logging
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import anthropic
 
 from config import settings
+from core.item_normalizer import normalize as _normalize_item
+from core.shopping_engine import generate_suggestions, format_suggestions
 from db.store import (
     get_current_pantry_items,
     get_recent_purchases,
+    get_purchase_history,
     clear_pantry_items,
     insert_receipt,
     insert_receipt_items,
     insert_pantry_snapshot,
     insert_pantry_items,
+    insert_chat_message,
+    get_recent_chat_messages,
+    add_manual_pantry_item,
+    remove_pantry_item,
+    insert_reminder,
+    get_pending_reminders,
+    get_user_timezone,
 )
 from core.receipt_extractor import extract_receipt, format_receipt_summary
 from core.pantry_extractor import extract_pantry, format_pantry_summary
-from core.shopping_engine import generate_suggestions, format_suggestions
 
 logger = logging.getLogger(__name__)
 
@@ -279,25 +290,246 @@ def _format_inventory(user_id: int) -> str:
     return "\n".join(lines)
 
 
-def _handle_chat(user_id: int, text: str) -> str:
-    """Handle natural language text via Claude."""
+_TOOLS = [
+    {
+        "name": "get_pantry_inventory",
+        "description": (
+            "Get the user's current pantry/fridge/freezer inventory. "
+            "Returns all items currently tracked with their location, quantity, and condition."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_purchase_history",
+        "description": (
+            "Get the user's recent purchase history from scanned receipts. "
+            "Shows items bought, store, date, and price."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "Number of days to look back. Default 30."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_shopping_suggestions",
+        "description": (
+            "Generate smart shopping suggestions by comparing purchase history "
+            "against current pantry inventory. Shows what to buy and why."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "add_pantry_item",
+        "description": "Add an item to the user's pantry, fridge, or freezer inventory manually.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "item_name": {"type": "string", "description": "Name of the item."},
+                "location": {"type": "string", "enum": ["pantry", "fridge", "freezer"], "description": "Where the item is stored."},
+                "category": {"type": "string", "description": "Optional category (e.g. 'dairy', 'produce')."},
+            },
+            "required": ["item_name", "location"],
+        },
+    },
+    {
+        "name": "remove_pantry_item",
+        "description": "Remove an item from the user's pantry/fridge/freezer inventory.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "item_name": {"type": "string", "description": "Name of the item to remove."},
+            },
+            "required": ["item_name"],
+        },
+    },
+    {
+        "name": "set_reminder",
+        "description": "Schedule a reminder. The reminder will be sent as a Telegram message when due.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reminder_text": {"type": "string", "description": "What to remind the user about."},
+                "due_at": {"type": "string", "description": "ISO 8601 datetime (e.g. '2026-03-15T09:00:00'). Interpreted in the user's timezone."},
+            },
+            "required": ["reminder_text", "due_at"],
+        },
+    },
+    {
+        "name": "list_reminders",
+        "description": "Show the user's pending (unsent) reminders.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+]
+
+_MAX_TOOL_ROUNDS = 5
+
+
+def _build_system_prompt(user_tz: str) -> str:
+    now = datetime.now(ZoneInfo(user_tz))
+    return (
+        "You are Pantry Pilot, a helpful personal assistant integrated with the user's pantry, "
+        "purchase history, and reminder system. You can look up their inventory, "
+        "suggest what to buy, add or remove items, and set reminders.\n\n"
+        "Use the provided tools to answer questions — do NOT guess about inventory "
+        "or purchases; always call the relevant tool first.\n\n"
+        "When setting reminders, convert relative times (like 'tomorrow morning') "
+        "to absolute ISO datetimes based on the current time.\n\n"
+        "Keep responses concise and conversational. Use plain text (no HTML, no markdown).\n\n"
+        f"Current date/time: {now.strftime('%Y-%m-%d %H:%M %Z')}\n"
+        f"User timezone: {user_tz}\n"
+    )
+
+
+def _execute_tool(user_id: int, tool_name: str, tool_input: dict) -> str:
+    """Dispatch a tool call to the appropriate function, return a string result."""
     try:
+        if tool_name == "get_pantry_inventory":
+            items = get_current_pantry_items(user_id)
+            if not items:
+                return "Pantry is empty. No items tracked yet."
+            lines = []
+            current_loc = None
+            for item in items:
+                loc = item.get("snapshot_type", "unknown")
+                if loc != current_loc:
+                    current_loc = loc
+                    lines.append(f"\n[{loc.upper()}]")
+                qty = item.get("estimated_qty", "")
+                cond = item.get("condition", "")
+                extra = f" ({qty})" if qty else ""
+                extra += f" - {cond}" if cond and cond != "good" else ""
+                lines.append(f"  - {item['item_name']}{extra}")
+            return "\n".join(lines)
+
+        if tool_name == "get_purchase_history":
+            days = tool_input.get("days", 30)
+            items = get_recent_purchases(user_id, days=days)
+            if not items:
+                return f"No purchases found in the last {days} days."
+            lines = [f"Purchases (last {days} days):"]
+            for item in items:
+                price = f" ${item['price']}" if item.get("price") else ""
+                store = f" @ {item['store_name']}" if item.get("store_name") else ""
+                dt = f" ({item['purchase_date']})" if item.get("purchase_date") else ""
+                lines.append(f"  - {item['item_name']}{price}{store}{dt}")
+            return "\n".join(lines)
+
+        if tool_name == "get_shopping_suggestions":
+            suggestions = generate_suggestions(user_id)
+            return format_suggestions(suggestions)
+
+        if tool_name == "add_pantry_item":
+            item_name = tool_input["item_name"]
+            location = tool_input["location"]
+            category = tool_input.get("category")
+            normalized = _normalize_item(item_name)
+            add_manual_pantry_item(user_id, item_name, normalized, location, category)
+            return f"Added '{item_name}' to {location}."
+
+        if tool_name == "remove_pantry_item":
+            item_name = tool_input["item_name"]
+            normalized = _normalize_item(item_name)
+            count = remove_pantry_item(user_id, normalized)
+            if count:
+                return f"Removed '{item_name}' from inventory ({count} item(s))."
+            return f"No current item matching '{item_name}' found in inventory."
+
+        if tool_name == "set_reminder":
+            reminder_text = tool_input["reminder_text"]
+            due_at_str = tool_input["due_at"]
+            user_tz = get_user_timezone(user_id)
+            tz = ZoneInfo(user_tz)
+            naive_dt = datetime.fromisoformat(due_at_str)
+            if naive_dt.tzinfo is None:
+                local_dt = naive_dt.replace(tzinfo=tz)
+            else:
+                local_dt = naive_dt
+            utc_dt = local_dt.astimezone(ZoneInfo("UTC"))
+            insert_reminder(user_id, reminder_text, utc_dt.isoformat())
+            local_str = local_dt.strftime("%b %d at %I:%M %p %Z")
+            return f"Reminder set: '{reminder_text}' — {local_str}"
+
+        if tool_name == "list_reminders":
+            reminders = get_pending_reminders(user_id)
+            if not reminders:
+                return "No pending reminders."
+            user_tz = get_user_timezone(user_id)
+            tz = ZoneInfo(user_tz)
+            lines = ["Pending reminders:"]
+            for r in reminders:
+                due = r["due_at"]
+                if isinstance(due, str):
+                    due = datetime.fromisoformat(due)
+                local_due = due.astimezone(tz)
+                lines.append(
+                    f"  - {r['reminder_text']} (due {local_due.strftime('%b %d at %I:%M %p')})"
+                )
+            return "\n".join(lines)
+
+        return f"Unknown tool: {tool_name}"
+
+    except Exception as exc:
+        logger.error("Tool execution error (%s): %s", tool_name, exc)
+        return f"Error executing {tool_name}: {exc}"
+
+
+def _handle_chat(user_id: int, text: str) -> str:
+    """Handle natural language text via Claude tool-use agent loop."""
+    # Load conversation history
+    history = get_recent_chat_messages(user_id, limit=20)
+    messages = [{"role": h["role"], "content": h["content"]} for h in history]
+    messages.append({"role": "user", "content": text})
+
+    user_tz = get_user_timezone(user_id)
+    system_prompt = _build_system_prompt(user_tz)
+
+    for _round in range(_MAX_TOOL_ROUNDS):
         response = _client.messages.create(
             model=settings.claude_model,
-            max_tokens=500,
-            system=(
-                "You are Pantry Pilot, a helpful shopping assistant bot on Telegram. "
-                "Users send you receipt and pantry photos to track their groceries. "
-                "Answer questions about food, cooking, and shopping. "
-                "Keep responses concise (2-3 sentences max). "
-                "If they seem to be asking about a feature, point them to /help."
-            ),
-            messages=[{"role": "user", "content": text}],
+            max_tokens=1024,
+            system=system_prompt,
+            tools=_TOOLS,
+            messages=messages,
         )
-        return response.content[0].text
-    except Exception as exc:
-        logger.error("Chat error: %s", exc)
-        return "Sorry, I couldn't process that. Try /help for available commands."
+
+        if response.stop_reason == "end_turn":
+            reply_parts = [
+                block.text for block in response.content if block.type == "text"
+            ]
+            reply = "\n".join(reply_parts) if reply_parts else "I'm not sure how to help with that."
+            insert_chat_message(user_id, "user", text)
+            insert_chat_message(user_id, "assistant", reply)
+            return reply
+
+        if response.stop_reason == "tool_use":
+            messages.append({"role": "assistant", "content": response.content})
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    result_str = _execute_tool(user_id, block.name, block.input)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result_str,
+                    })
+            messages.append({"role": "user", "content": tool_results})
+            continue
+
+        reply_parts = [
+            block.text for block in response.content if block.type == "text"
+        ]
+        reply = "\n".join(reply_parts) if reply_parts else "Sorry, something went wrong."
+        insert_chat_message(user_id, "user", text)
+        insert_chat_message(user_id, "assistant", reply)
+        return reply
+
+    reply = "I ran into a loop trying to answer. Could you rephrase your question?"
+    insert_chat_message(user_id, "user", text)
+    insert_chat_message(user_id, "assistant", reply)
+    return reply
 
 
 def _parse_date(date_str: str | None) -> date | None:
