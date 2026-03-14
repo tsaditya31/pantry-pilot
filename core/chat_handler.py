@@ -2,6 +2,7 @@
 Chat handler — route commands, photos, and natural language messages.
 """
 
+import base64
 import json
 import logging
 from datetime import date
@@ -31,8 +32,8 @@ _WELCOME = """Welcome to <b>Pantry Pilot</b>!
 I help you track what you buy and what you have, then tell you what to get next.
 
 <b>How to use:</b>
-1. Send a receipt photo with caption "receipt"
-2. Send a pantry/fridge photo with caption "pantry" or "fridge"
+1. Send a receipt photo — I'll extract your purchases
+2. Send a pantry/fridge/freezer photo — I'll identify what you have
 3. Use /list to get shopping suggestions
 
 Type /help for all commands."""
@@ -40,10 +41,8 @@ Type /help for all commands."""
 _HELP = """<b>Pantry Pilot Commands</b>
 
 <b>Photos:</b>
-  Send photo + caption "receipt" — Log a receipt
-  Send photo + caption "pantry" — Update pantry inventory
-  Send photo + caption "fridge" — Update fridge inventory
-  Send photo + caption "freezer" — Update freezer inventory
+  Just send a photo — I'll auto-detect if it's a receipt, pantry, fridge, or freezer!
+  You can also add a caption to be explicit.
 
 <b>Commands:</b>
   /list — Get shopping suggestions
@@ -87,29 +86,67 @@ def handle_message(user_id: int, chat_id: int, text: str) -> str:
 def handle_photo(user_id: int, chat_id: int, file_id: str,
                  image_data: bytes, caption: str) -> str:
     """Handle a photo message from a user."""
-    if not caption:
-        return (
-            "Please resend the photo with a caption:\n"
-            '  • "receipt" — to log a purchase\n'
-            '  • "pantry", "fridge", or "freezer" — to update inventory'
-        )
-
+    # If caption provided, use it directly
     if caption in ("receipt", "r"):
         return _process_receipt(user_id, file_id, image_data)
-
     if caption in ("pantry", "fridge", "freezer", "p", "f"):
-        location = caption[0]
-        location_map = {"p": "pantry", "f": "fridge", "r": "receipt"}
-        location_type = {"p": "pantry", "f": "fridge"}.get(location, caption)
-        if caption in ("pantry", "fridge", "freezer"):
-            location_type = caption
+        location_type = {"p": "pantry", "f": "fridge"}.get(caption, caption)
         return _process_pantry(user_id, file_id, image_data, location_type)
 
+    # Auto-classify the photo using Claude vision
+    photo_type = _classify_photo(image_data)
+    logger.info("Auto-classified photo as: %s", photo_type)
+
+    if photo_type == "receipt":
+        return _process_receipt(user_id, file_id, image_data)
+    if photo_type in ("pantry", "fridge", "freezer"):
+        return _process_pantry(user_id, file_id, image_data, photo_type)
+
     return (
-        f'Unknown caption "{caption}". Please use:\n'
-        '  • "receipt" — to log a purchase\n'
-        '  • "pantry", "fridge", or "freezer" — to update inventory'
+        "I couldn't tell what this photo is. Please try again with a clearer photo, "
+        "or add a caption: \"receipt\", \"pantry\", \"fridge\", or \"freezer\"."
     )
+
+
+def _classify_photo(image_data: bytes) -> str:
+    """Use Claude vision to classify a photo as receipt, pantry, fridge, freezer, or unknown."""
+    b64 = base64.standard_b64encode(image_data).decode("utf-8")
+    try:
+        response = _client.messages.create(
+            model=settings.claude_model,
+            max_tokens=20,
+            system=(
+                "Classify this photo into exactly one category. "
+                "Reply with ONLY one word: receipt, pantry, fridge, freezer, or unknown. "
+                "A receipt is a store receipt or bill. "
+                "A pantry is shelves with dry goods/canned items. "
+                "A fridge is an open refrigerator showing food. "
+                "A freezer is a freezer compartment with frozen items."
+            ),
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": b64,
+                            },
+                        },
+                        {"type": "text", "text": "What is this?"},
+                    ],
+                }
+            ],
+        )
+        result = response.content[0].text.strip().lower()
+        if result in ("receipt", "pantry", "fridge", "freezer"):
+            return result
+        return "unknown"
+    except Exception as exc:
+        logger.error("Photo classification failed: %s", exc)
+        return "unknown"
 
 
 def _process_receipt(user_id: int, file_id: str, image_data: bytes) -> str:
