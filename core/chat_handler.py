@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 import anthropic
 
 from config import settings
+from core.instacart import create_shopping_list
 from core.item_normalizer import normalize as _normalize_item
 from core.shopping_engine import generate_suggestions, format_suggestions
 from db.store import (
@@ -83,7 +84,12 @@ def handle_message(user_id: int, chat_id: int, text: str) -> str:
 
     if cmd == "/list":
         suggestions = generate_suggestions(user_id, history_days=settings.purchase_history_days)
-        return format_suggestions(suggestions)
+        text = format_suggestions(suggestions)
+        if suggestions:
+            instacart_url = create_shopping_list(user_id, suggestions)
+            if instacart_url:
+                text += f'\n\n<a href="{instacart_url}">Open in Instacart</a>'
+        return text
 
     if cmd == "/history":
         return _format_history(user_id)
@@ -488,7 +494,12 @@ def _execute_tool(user_id: int, tool_name: str, tool_input: dict) -> str:
 
         if tool_name == "get_shopping_suggestions":
             suggestions = generate_suggestions(user_id)
-            return format_suggestions(suggestions)
+            text = format_suggestions(suggestions)
+            if suggestions:
+                instacart_url = create_shopping_list(user_id, suggestions)
+                if instacart_url:
+                    text += f"\n\nInstacart shopping list: {instacart_url}"
+            return text
 
         if tool_name == "add_pantry_item":
             item_name = tool_input["item_name"]

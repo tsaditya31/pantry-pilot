@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     claude_model: str = "claude-sonnet-4-6"
     purchase_history_days: int = 90
     restock_check_hour: int = 9
+    instacart_api_key: str = ""
 
 
 settings = Settings()
