@@ -1,60 +1,82 @@
 """
 Shopping engine — analyze purchase history vs current pantry to generate suggestions.
+Integrates stocking rules and consumption rate modeling.
 """
 
 import logging
 from datetime import date, timedelta
 
-from db.store import get_purchase_history, get_current_pantry_items, save_suggestions
+from core.consumption_model import compute_all_rates
+from db.store import (
+    get_purchase_history,
+    get_current_pantry_items,
+    get_stocking_rules,
+    save_suggestions,
+)
 
 logger = logging.getLogger(__name__)
 
 
 def generate_suggestions(user_id: int, history_days: int = 90) -> list[dict]:
-    """Generate shopping suggestions based on purchase history vs pantry.
-
-    Algorithm:
-    1. Get purchase history (last N days), grouped by normalized_name
-    2. Get current pantry items (is_current=TRUE)
-    3. For each regularly-purchased item:
-       - NOT in pantry → high priority
-       - In pantry but "nearly_empty" → normal priority
-       - Overdue vs avg purchase interval → low priority
-    4. Return sorted by priority
-    """
+    """Generate shopping suggestions based on stocking rules, consumption
+    modeling, purchase history, and current pantry state."""
     history = get_purchase_history(user_id, days=history_days)
     pantry = get_current_pantry_items(user_id)
 
-    # Build pantry lookup: normalized_name → item info
-    pantry_lookup = {}
-    for item in pantry:
-        pantry_lookup[item["normalized_name"]] = item
+    pantry_lookup = {item["normalized_name"]: item for item in pantry}
 
     suggestions = []
+    suggested_names: set[str] = set()
     today = date.today()
 
+    # ── Pass 1: Stocking rules ───────────────────────────────────────────
+    rules = get_stocking_rules(user_id)
+    for rule in rules:
+        norm_name = rule["normalized_name"]
+        display = rule["display_name"]
+        pantry_item = pantry_lookup.get(norm_name)
+
+        if pantry_item is None:
+            suggestions.append({
+                "item_name": display,
+                "normalized_name": norm_name,
+                "reason": "Always-stock rule: not in pantry",
+                "priority": "high",
+                "last_purchased": None,
+                "in_pantry": False,
+            })
+            suggested_names.add(norm_name)
+        elif pantry_item.get("condition") == "nearly_empty":
+            suggestions.append({
+                "item_name": display,
+                "normalized_name": norm_name,
+                "reason": "Always-stock rule: running low",
+                "priority": "high",
+                "last_purchased": None,
+                "in_pantry": True,
+            })
+            suggested_names.add(norm_name)
+
+    # ── Pass 2: Consumption rate predictions ─────────────────────────────
+    rates = compute_all_rates(user_id)
+    rate_lookup = {r["normalized_name"]: r for r in rates}
+
+    # ── Pass 3: Purchase history analysis ────────────────────────────────
     for purchase in history:
         norm_name = purchase["normalized_name"]
+        if norm_name in suggested_names:
+            continue
+
         purchase_count = purchase["purchase_count"]
         last_purchased = purchase["last_purchased"]
         first_purchased = purchase["first_purchased"]
 
-        # Skip items bought only once (not a pattern)
         if purchase_count < 2:
             continue
 
-        # Compute average purchase interval
-        if last_purchased and first_purchased and last_purchased != first_purchased:
-            span_days = (last_purchased - first_purchased).days
-            avg_interval = span_days / (purchase_count - 1)
-        else:
-            avg_interval = None
-
         pantry_item = pantry_lookup.get(norm_name)
-        days_since = (today - last_purchased).days if last_purchased else None
 
         if pantry_item is None:
-            # Not in pantry at all → high priority
             suggestions.append({
                 "item_name": norm_name.title(),
                 "normalized_name": norm_name,
@@ -63,8 +85,10 @@ def generate_suggestions(user_id: int, history_days: int = 90) -> list[dict]:
                 "last_purchased": last_purchased,
                 "in_pantry": False,
             })
-        elif pantry_item.get("condition") == "nearly_empty":
-            # In pantry but running low → normal priority
+            suggested_names.add(norm_name)
+            continue
+
+        if pantry_item.get("condition") == "nearly_empty":
             suggestions.append({
                 "item_name": norm_name.title(),
                 "normalized_name": norm_name,
@@ -73,22 +97,44 @@ def generate_suggestions(user_id: int, history_days: int = 90) -> list[dict]:
                 "last_purchased": last_purchased,
                 "in_pantry": True,
             })
-        elif avg_interval and days_since and days_since > avg_interval * 1.2:
-            # Overdue based on purchase pattern → low priority
-            suggestions.append({
-                "item_name": norm_name.title(),
-                "normalized_name": norm_name,
-                "reason": f"Usually buy every ~{avg_interval:.0f} days, last bought {days_since} days ago",
-                "priority": "low",
-                "last_purchased": last_purchased,
-                "in_pantry": True,
-            })
+            suggested_names.add(norm_name)
+            continue
+
+        # Use consumption rate if available, otherwise fall back to simple interval
+        rate = rate_lookup.get(norm_name)
+        if rate and rate["estimated_runout_date"]:
+            days_until_runout = (rate["estimated_runout_date"] - today).days
+            if days_until_runout <= 3:
+                suggestions.append({
+                    "item_name": norm_name.title(),
+                    "normalized_name": norm_name,
+                    "reason": f"Predicted to run out in ~{max(days_until_runout, 0)} days",
+                    "priority": "low",
+                    "last_purchased": last_purchased,
+                    "in_pantry": True,
+                })
+                suggested_names.add(norm_name)
+        else:
+            # Fallback: simple interval check
+            if last_purchased and first_purchased and last_purchased != first_purchased:
+                span_days = (last_purchased - first_purchased).days
+                avg_interval = span_days / (purchase_count - 1)
+                days_since = (today - last_purchased).days
+                if days_since > avg_interval * 1.2:
+                    suggestions.append({
+                        "item_name": norm_name.title(),
+                        "normalized_name": norm_name,
+                        "reason": f"Usually buy every ~{avg_interval:.0f} days, last bought {days_since} days ago",
+                        "priority": "low",
+                        "last_purchased": last_purchased,
+                        "in_pantry": True,
+                    })
+                    suggested_names.add(norm_name)
 
     # Sort by priority
     priority_order = {"high": 0, "normal": 1, "low": 2}
     suggestions.sort(key=lambda s: (priority_order.get(s["priority"], 3), s["item_name"]))
 
-    # Save to DB
     if suggestions:
         save_suggestions(user_id, suggestions)
 

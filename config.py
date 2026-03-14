@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     bot_poll_interval: float = 2.0
     claude_model: str = "claude-sonnet-4-6"
     purchase_history_days: int = 90
+    restock_check_hour: int = 9
 
 
 settings = Settings()

@@ -3,13 +3,16 @@ Telegram bot — long-polling loop with multi-user support and photo handling.
 """
 
 import logging
+import threading
 import time
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
 from config import settings
 from bot.telegram_api import send_message, send_chat_action, download_file
 from core.chat_handler import handle_message, handle_photo
+from core.restock_checker import run_daily_restock_check
 from db.store import upsert_user, get_due_reminders, mark_reminder_sent
 
 logger = logging.getLogger(__name__)
@@ -118,9 +121,35 @@ def _check_reminders():
         logger.warning("Reminder check error: %s", exc)
 
 
+def _daily_restock_job():
+    """Daemon thread: sleep until the configured hour (UTC), run restock check, repeat."""
+    check_hour = settings.restock_check_hour
+    logger.info("Restock checker daemon started (runs daily at %02d:00 UTC)", check_hour)
+    while True:
+        now = datetime.now(timezone.utc)
+        # Compute seconds until next check_hour
+        target = now.replace(hour=check_hour, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target = target + timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        logger.debug("Restock checker sleeping %.0f seconds until %s", wait_seconds, target)
+        time.sleep(wait_seconds)
+
+        try:
+            logger.info("Running daily restock check...")
+            run_daily_restock_check()
+        except Exception as exc:
+            logger.error("Daily restock check error: %s", exc)
+
+
 def run_polling_loop():
     """Block forever, polling Telegram for new messages."""
     _delete_webhook()
+
+    # Start daily restock checker daemon
+    restock_thread = threading.Thread(target=_daily_restock_job, daemon=True)
+    restock_thread.start()
+
     logger.info("Pantry Pilot bot polling started.")
     offset = 0
 

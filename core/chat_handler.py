@@ -30,6 +30,11 @@ from db.store import (
     insert_reminder,
     get_pending_reminders,
     get_user_timezone,
+    upsert_user_profile,
+    get_user_profile,
+    upsert_stocking_rule,
+    remove_stocking_rule as db_remove_stocking_rule,
+    get_stocking_rules,
 )
 from core.receipt_extractor import extract_receipt, format_receipt_summary
 from core.pantry_extractor import extract_pantry, format_pantry_summary
@@ -362,24 +367,88 @@ _TOOLS = [
         "description": "Show the user's pending (unsent) reminders.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
+    {
+        "name": "update_profile",
+        "description": (
+            "Update the user's household profile: family size, dietary preferences, "
+            "and preferred shopping day."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "family_size": {"type": "integer", "description": "Number of people in the household."},
+                "dietary_preferences": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of dietary preferences (e.g. 'vegetarian', 'gluten-free').",
+                },
+                "preferred_shopping_day": {
+                    "type": "integer",
+                    "description": "Preferred shopping day: 0=Monday, 1=Tuesday, ..., 6=Sunday.",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_profile",
+        "description": "Get the user's household profile and all active stocking rules.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "add_stocking_rule",
+        "description": "Add an always-stock rule: ensure this item is always kept stocked.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "item_name": {"type": "string", "description": "Name of the item to always keep stocked."},
+                "min_quantity": {"type": "integer", "description": "Minimum quantity to keep. Default 1."},
+            },
+            "required": ["item_name"],
+        },
+    },
+    {
+        "name": "remove_stocking_rule",
+        "description": "Remove an always-stock rule for an item.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "item_name": {"type": "string", "description": "Name of the item to stop auto-stocking."},
+            },
+            "required": ["item_name"],
+        },
+    },
 ]
 
 _MAX_TOOL_ROUNDS = 5
 
 
-def _build_system_prompt(user_tz: str) -> str:
+def _build_system_prompt(user_id: int, user_tz: str) -> str:
     now = datetime.now(ZoneInfo(user_tz))
+    profile = get_user_profile(user_id)
+    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    pref_day = profile.get("preferred_shopping_day")
+    profile_ctx = (
+        f"Household: {profile.get('family_size', 1)} person(s), "
+        f"dietary preferences: {profile.get('dietary_preferences', [])}, "
+        f"preferred shopping day: {day_names[pref_day] if pref_day is not None else 'not set'}"
+    )
     return (
         "You are Pantry Pilot, a helpful personal assistant integrated with the user's pantry, "
-        "purchase history, and reminder system. You can look up their inventory, "
-        "suggest what to buy, add or remove items, and set reminders.\n\n"
+        "purchase history, reminder system, and household profile. You can look up their inventory, "
+        "suggest what to buy, add or remove items, set reminders, manage their profile and "
+        "always-stock rules.\n\n"
         "Use the provided tools to answer questions — do NOT guess about inventory "
         "or purchases; always call the relevant tool first.\n\n"
+        "When the user mentions family size, dietary preferences, or preferred shopping day, "
+        "use the update_profile tool. When they say to always keep something stocked, "
+        "use the add_stocking_rule tool.\n\n"
         "When setting reminders, convert relative times (like 'tomorrow morning') "
         "to absolute ISO datetimes based on the current time.\n\n"
         "Keep responses concise and conversational. Use plain text (no HTML, no markdown).\n\n"
         f"Current date/time: {now.strftime('%Y-%m-%d %H:%M %Z')}\n"
         f"User timezone: {user_tz}\n"
+        f"{profile_ctx}\n"
     )
 
 
@@ -469,6 +538,58 @@ def _execute_tool(user_id: int, tool_name: str, tool_input: dict) -> str:
                 )
             return "\n".join(lines)
 
+        if tool_name == "update_profile":
+            profile = upsert_user_profile(
+                user_id,
+                family_size=tool_input.get("family_size"),
+                dietary_preferences=tool_input.get("dietary_preferences"),
+                preferred_shopping_day=tool_input.get("preferred_shopping_day"),
+            )
+            day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            pref_day = profile.get("preferred_shopping_day")
+            day_str = day_names[pref_day] if pref_day is not None else "not set"
+            return (
+                f"Profile updated:\n"
+                f"  Family size: {profile['family_size']}\n"
+                f"  Dietary preferences: {profile.get('dietary_preferences', [])}\n"
+                f"  Preferred shopping day: {day_str}"
+            )
+
+        if tool_name == "get_profile":
+            profile = get_user_profile(user_id)
+            rules = get_stocking_rules(user_id)
+            day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            pref_day = profile.get("preferred_shopping_day")
+            day_str = day_names[pref_day] if pref_day is not None else "not set"
+            lines = [
+                "Household Profile:",
+                f"  Family size: {profile.get('family_size', 1)}",
+                f"  Dietary preferences: {profile.get('dietary_preferences', [])}",
+                f"  Preferred shopping day: {day_str}",
+            ]
+            if rules:
+                lines.append("\nAlways-Stock Rules:")
+                for r in rules:
+                    lines.append(f"  - {r['display_name']} (min qty: {r['min_quantity']})")
+            else:
+                lines.append("\nNo always-stock rules set.")
+            return "\n".join(lines)
+
+        if tool_name == "add_stocking_rule":
+            item_name = tool_input["item_name"]
+            min_qty = tool_input.get("min_quantity", 1)
+            normalized = _normalize_item(item_name)
+            upsert_stocking_rule(user_id, normalized, item_name, min_qty)
+            return f"Stocking rule added: always keep '{item_name}' stocked (min qty: {min_qty})."
+
+        if tool_name == "remove_stocking_rule":
+            item_name = tool_input["item_name"]
+            normalized = _normalize_item(item_name)
+            count = db_remove_stocking_rule(user_id, normalized)
+            if count:
+                return f"Stocking rule removed for '{item_name}'."
+            return f"No active stocking rule found for '{item_name}'."
+
         return f"Unknown tool: {tool_name}"
 
     except Exception as exc:
@@ -484,7 +605,7 @@ def _handle_chat(user_id: int, text: str) -> str:
     messages.append({"role": "user", "content": text})
 
     user_tz = get_user_timezone(user_id)
-    system_prompt = _build_system_prompt(user_tz)
+    system_prompt = _build_system_prompt(user_id, user_tz)
 
     for _round in range(_MAX_TOOL_ROUNDS):
         response = _client.messages.create(

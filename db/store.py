@@ -106,6 +106,49 @@ def init_db():
         created_at TIMESTAMPTZ DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS user_profiles (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) UNIQUE,
+        family_size INTEGER DEFAULT 1,
+        dietary_preferences JSONB DEFAULT '[]',
+        preferred_shopping_day INTEGER,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS stocking_rules (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        normalized_name TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        min_quantity INTEGER DEFAULT 1,
+        active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_id, normalized_name)
+    );
+
+    CREATE TABLE IF NOT EXISTS consumption_rates (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        normalized_name TEXT NOT NULL,
+        avg_interval_days NUMERIC,
+        estimated_runout_date DATE,
+        confidence TEXT,
+        data_points INTEGER,
+        last_computed TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_id, normalized_name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_consumption_rates_runout
+        ON consumption_rates(user_id, estimated_runout_date);
+
+    CREATE TABLE IF NOT EXISTS restock_notifications (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        normalized_name TEXT NOT NULL,
+        notified_for_date DATE NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(user_id, normalized_name, notified_for_date)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_receipt_items_user ON receipt_items(user_id);
     CREATE INDEX IF NOT EXISTS idx_receipt_items_normalized ON receipt_items(normalized_name);
     CREATE INDEX IF NOT EXISTS idx_pantry_items_user_current ON pantry_items(user_id, is_current);
@@ -474,3 +517,183 @@ def get_user_timezone(user_id: int) -> str:
             if row and row.get("timezone"):
                 return row["timezone"]
     return "America/Los_Angeles"
+
+
+# ── User Profiles ────────────────────────────────────────────────────────────
+
+def upsert_user_profile(user_id: int, family_size: int = None,
+                        dietary_preferences: list = None,
+                        preferred_shopping_day: int = None) -> dict:
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO user_profiles (user_id, family_size, dietary_preferences, preferred_shopping_day, updated_at)
+                VALUES (%s, COALESCE(%s, 1), COALESCE(%s, '[]'::jsonb), %s, NOW())
+                ON CONFLICT (user_id) DO UPDATE SET
+                    family_size = COALESCE(%s, user_profiles.family_size),
+                    dietary_preferences = COALESCE(%s, user_profiles.dietary_preferences),
+                    preferred_shopping_day = COALESCE(%s, user_profiles.preferred_shopping_day),
+                    updated_at = NOW()
+                RETURNING user_id, family_size, dietary_preferences, preferred_shopping_day, updated_at
+                """,
+                (user_id, family_size,
+                 json.dumps(dietary_preferences) if dietary_preferences is not None else None,
+                 preferred_shopping_day,
+                 family_size,
+                 json.dumps(dietary_preferences) if dietary_preferences is not None else None,
+                 preferred_shopping_day),
+            )
+            row = dict(cur.fetchone())
+        conn.commit()
+    return row
+
+
+def get_user_profile(user_id: int) -> dict:
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT user_id, family_size, dietary_preferences, preferred_shopping_day, updated_at "
+                "FROM user_profiles WHERE user_id = %s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+    if row:
+        return dict(row)
+    return {"user_id": user_id, "family_size": 1, "dietary_preferences": [], "preferred_shopping_day": None}
+
+
+# ── Stocking Rules ───────────────────────────────────────────────────────────
+
+def upsert_stocking_rule(user_id: int, normalized_name: str, display_name: str,
+                         min_quantity: int = 1):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO stocking_rules (user_id, normalized_name, display_name, min_quantity)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (user_id, normalized_name) DO UPDATE SET
+                    display_name = EXCLUDED.display_name,
+                    min_quantity = EXCLUDED.min_quantity,
+                    active = TRUE
+                """,
+                (user_id, normalized_name, display_name, min_quantity),
+            )
+        conn.commit()
+
+
+def remove_stocking_rule(user_id: int, normalized_name: str) -> int:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE stocking_rules SET active = FALSE WHERE user_id = %s AND normalized_name = %s AND active = TRUE",
+                (user_id, normalized_name),
+            )
+            count = cur.rowcount
+        conn.commit()
+    return count
+
+
+def get_stocking_rules(user_id: int) -> list[dict]:
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT normalized_name, display_name, min_quantity, created_at "
+                "FROM stocking_rules WHERE user_id = %s AND active = TRUE ORDER BY display_name",
+                (user_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+# ── Consumption Rates ────────────────────────────────────────────────────────
+
+def get_all_purchased_items(user_id: int, min_purchases: int = 2, days: int = 365) -> list[dict]:
+    """Get items with aggregated purchase dates for consumption modeling."""
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT ri.normalized_name,
+                       COUNT(DISTINCT r.purchase_date) as purchase_count,
+                       ARRAY_AGG(DISTINCT r.purchase_date ORDER BY r.purchase_date) as purchase_dates,
+                       MAX(r.purchase_date) as last_purchased
+                FROM receipt_items ri
+                JOIN receipts r ON r.id = ri.receipt_id
+                WHERE ri.user_id = %s
+                  AND r.purchase_date >= CURRENT_DATE - INTERVAL '%s days'
+                GROUP BY ri.normalized_name
+                HAVING COUNT(DISTINCT r.purchase_date) >= %s
+                """,
+                (user_id, days, min_purchases),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+def upsert_consumption_rate(user_id: int, normalized_name: str,
+                            avg_interval_days: float, estimated_runout_date: date,
+                            confidence: str, data_points: int):
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO consumption_rates
+                    (user_id, normalized_name, avg_interval_days, estimated_runout_date,
+                     confidence, data_points, last_computed)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (user_id, normalized_name) DO UPDATE SET
+                    avg_interval_days = EXCLUDED.avg_interval_days,
+                    estimated_runout_date = EXCLUDED.estimated_runout_date,
+                    confidence = EXCLUDED.confidence,
+                    data_points = EXCLUDED.data_points,
+                    last_computed = NOW()
+                """,
+                (user_id, normalized_name, avg_interval_days, estimated_runout_date,
+                 confidence, data_points),
+            )
+        conn.commit()
+
+
+def get_consumption_rates(user_id: int) -> list[dict]:
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT normalized_name, avg_interval_days, estimated_runout_date,
+                       confidence, data_points, last_computed
+                FROM consumption_rates
+                WHERE user_id = %s
+                ORDER BY estimated_runout_date
+                """,
+                (user_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+
+# ── Restock Notifications ────────────────────────────────────────────────────
+
+def insert_restock_notification(user_id: int, normalized_name: str, notified_for_date: date) -> bool:
+    """Insert notification dedup record. Returns True if inserted (not a duplicate)."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO restock_notifications (user_id, normalized_name, notified_for_date)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (user_id, normalized_name, notified_for_date),
+                )
+                conn.commit()
+                return True
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                return False
+
+
+def get_all_user_ids() -> list[int]:
+    """Return all user IDs."""
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users")
+            return [row[0] for row in cur.fetchall()]
